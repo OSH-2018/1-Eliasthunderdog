@@ -2,9 +2,10 @@
 
 ## 引导程序加载
 
-0xx7c00:
+0x7c00: 0x7c00是早期工程师设计的一个“魔数”，为的是每次都将引导程序加载到这里，从这里开始引导操作系统，
+之所以放在这里是方便给***留出空间预计的占用，引导操作系统的时候系统还工作在实模式状态。
 
-## 进入保护模式：go_to_protected_mode
+## 进入保护模式：go_to_protected_mode 函数
 
 在 arch/x86/boot/pm.c中定义了go_to_protected_mode函数，将操作系统的模式从实模式转向保护模式
 
@@ -12,7 +13,7 @@
 
 1. real_mode_switch_hook
 
-
+嗯这个还没弄清楚干什么用的。
 
 2. 打开A20 enable_a20
 
@@ -20,7 +21,7 @@
 
 3. mask_all_interrupts
 
-在实模式下的中断已经不用了，所以要全部mask掉
+在实模式下的中断已经不用了，所以要全部mask掉，直接对内存进行位操作即可。
 
 ``` c
 static void mask_all_interrupts(void)
@@ -34,7 +35,7 @@ static void mask_all_interrupts(void)
 
 4. setup_idt
 
-载入 idt
+载入 idt，即中断描述符表，每一个中断向量在表中都有相应的处理程序的入口地址。
 
 ``` c
 static void setup_idt(void)
@@ -51,8 +52,6 @@ static void setup_idt(void)
 ``` c
 static void setup_gdt(void)
 {
-        /* There are machines which are known to not boot with the GDT
-           being 8-byte unaligned.  Intel recommends 16 byte alignment. */
         static const u64 boot_gdt[] __attribute__((aligned(16))) = {
                 /* CS: code, read/execute, 4 GB, base 0 */
                 [GDT_ENTRY_BOOT_CS] = GDT_ENTRY(0xc09b, 0, 0xfffff),
@@ -63,16 +62,14 @@ static void setup_gdt(void)
                    we don't actually use it for anything. */
                 [GDT_ENTRY_BOOT_TSS] = GDT_ENTRY(0x0089, 4096, 103),
         };
-        /* Xen HVM incorrectly stores a pointer to the gdt_ptr, instead
-           of the gdt_ptr contents.  Thus, make it static so it will
-           stay in memory, at least long enough that we switch to the
-           proper kernel GDT. */
+
         static struct gdt_ptr gdt;
 
         gdt.len = sizeof(boot_gdt)-1;
         gdt.ptr = (u32)&boot_gdt + (ds() << 4);
 
         asm volatile("lgdtl %0" : : "m" (gdt));
+        // 最重要的是这一条，用内置的lgdtl指令载入gdt
 }
 ```
 
@@ -96,11 +93,9 @@ void set_task_stack_end_magic(struct task_struct *tsk)
 
 ```
 
-其中STACK_END_MAGIC是所谓的“魔数”，是设计者根据估计预先定义好的数。
+其中STACK_END_MAGIC也是“魔数”，是设计者根据估计预先定义好的数。
 
-（这个函数具体有什么作用，为什么要设置这个）
 
 ### trap_init() 函数
 
 这个函数的作用是初始化陷阱(trap)，trap在隔离用户态和内核态中起到了重要的作用，运行在内核态的程序要调用内核提供的服务，就要通过trap，trap指令使控制权由用户应用程序转移到内核。
-
