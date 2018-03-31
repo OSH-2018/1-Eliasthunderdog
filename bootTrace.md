@@ -26,7 +26,7 @@ make install
 
 进行编译，内核安装，再运行
 
-``` shell
+``` bash
 make bzImage
 ```
 
@@ -36,7 +36,7 @@ make bzImage
 
 2. 宿主机上运行qemu，只需要内核和initramfs,并不需要安装操作系统即可进行调试
 
-``` shell
+``` bash
 sudo qemu-system-x86_64 debian9.img -kernel /usr/src/linux-4.15.12/arch/x86/boot/bzImage -gdb tcp::1234 -S -append "nokaslr" -nographic
 ```
 
@@ -48,44 +48,53 @@ sudo qemu-system-x86_64 debian9.img -kernel /usr/src/linux-4.15.12/arch/x86/boot
 
 ## 实验结果
 
+追踪到了我认为比较重要或者经典的几个函数和事件。
+
+### cs ip 的初始化
+
+开始调试后，先不急着运行，在gdb控制台输入 info registers 结果发现用于定位指令地址的CS IP寄存器分别被初始化为了：
+
+CS = 0XF000 IP = 0XFFF0 查看CS BASE 为 0xffff0000 
+
+通过查找资料知道这个是Intel 80386以及后来的CPU预先设好的标准，在reset时都会变成这个状态。这个时候CPU工作在“实模式”。
+
 ### 引导程序加载
 
 0x7c00: 0x7c00是早期工程师设计的一个“魔数”，为的是每次都将引导程序加载到这里，从这里开始引导操作系统，
-之所以放在这里是方便给***留出空间预计的占用，引导操作系统的时候系统还工作在实模式状态。
+之所以放在这里是方便给当时的硬件驱动留出空间预计的占用，引导操作系统的时候系统还工作在实模式状态。
 
 注： 这个在只给虚拟机指定内核和initramfs的状况下是没法追踪到这个事件的，在一个正常安装的虚拟机上调试才能捕捉到。
 
 ### 进入保护模式：go_to_protected_mode 函数
 
-在 arch/x86/boot/pm.c中定义了go_to_protected_mode函数，将操作系统的模式从实模式转向保护模式
+首先我们需要进入32位的保护模式，再由32位切换到64位。
 
-进行的主要操作：
+在 arch/x86/boot/pm.c中定义了go_to_protected_mode函数，将操作系统的模式从实模式转向保护模式.
 
-1. real_mode_switch_hook
+---
 
-嗯这个还没弄清楚干什么用的。
+从代码中，我看到第一个执行的函数是
 
-2. 打开A20 enable_a20
-
-打开A20地址线，A20是为了让80286向前兼容设置的。
-
-3. mask_all_interrupts
-
-在实模式下的中断已经不用了，所以要全部mask掉，直接对内存进行位操作即可。
-
-``` c
-static void mask_all_interrupts(void)
-{
-        outb(0xff, 0xa1);       /* Mask all interrupts on the secondary PIC */
-        io_delay();
-        outb(0xfb, 0x21);       /* Mask all but cascade on the primary PIC */
-        io_delay();
-}
+```c
+/* Hook before leaving real mode, also disables interrupts */
+        realmode_switch_hook();
 ```
 
-4. setup_idt
+这里是一个准备的函数，作用相当于将保护模式的开关打开，并且要禁用一个叫NMI（Non-maskable interrupt），这个“保护模式开关”（hook，我找不到更好的翻译了）并不是所有的系统都有。
 
-载入 idt，即中断描述符表，每一个中断向量在表中都有相应的处理程序的入口地址。
+---
+
+打开A20 enable_a20
+
+打开A20地址线，A20是为了让80286向前兼容设置的, 这样设置可以让CPU最大可以识别1M的内存，也是一个历史遗留问题。
+
+这个函数定义在a20.c中, 从代码中大概看出来这个函数大概过程是：先检测A20打开没有，然后尝试通过BIOS打开，尝试通过键盘打开，再尝试通过一个port打开（命名为fast方式，可能比较快？），在255个loop中都失败了，那就返回-1，打不开。这条地址线是通向大内存的大门。
+
+---
+
+setup_idt
+
+载入 idt，即中断描述符表，每一个中断向量在表中都有相应的处理程序的入口地址，是描述系统中断的数据结构。
 
 ``` c
 static void setup_idt(void)
@@ -95,9 +104,11 @@ static void setup_idt(void)
 }
 ```
 
-5. setup_gdt
+---
 
-载入GDT，这是保护模式分页机制的实现基础
+setup_gdt
+
+载入GDT(全局描述符表)，这是保护模式的重要特征, gdt不仅能实现内存的分段机制，还能提供内存的权限保护。
 
 ``` c
 static void setup_gdt(void)
@@ -123,9 +134,17 @@ static void setup_gdt(void)
 }
 ```
 
+在 arch/x86/boot/pmjump.S 中，我找到一句：
+
+``` assembly
+jmpl  *%eax   # jump to 32-bit entry point.
+```
+
+可见这里就是32位保护模式的入口。
+
 ### 内核启动: start_kernel()函数
 
-这个函数非常复杂，分为几个主要的阶段。
+这个函数非常复杂，找出了认为比较重要的函数看看做了什么。
 
 #### set_task_stack_end_magic()
 
@@ -145,7 +164,18 @@ void set_task_stack_end_magic(struct task_struct *tsk)
 
 其中STACK_END_MAGIC也是“魔数”，是设计者根据估计预先定义好的数。
 
+#### setup_arch(&commandline)
+
+这个函数从名称上看是设置架构，commandline是一个已经处理后的变量，这个函数决定着之后很多与架构相关的操作是否进行，以及如何进行。
 
 #### trap_init() 函数
 
 这个函数的作用是初始化陷阱(trap)，trap在隔离用户态和内核态中起到了重要的作用，运行在内核态的程序要调用内核提供的服务，就要通过trap，trap指令使控制权由用户应用程序转移到内核。
+
+想用prink的方法写出日志文件来，但是感觉那样启动过程看不到具体的实现细节，上面找到的事件认为最重要的是：
+
+引导程序加载；
+
+进入保护模式；
+
+trap初始化（也许应该找找interrupt是怎么初始化的？）；
